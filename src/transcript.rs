@@ -155,6 +155,11 @@ fn parse_assistant_message(entry: &Value, state: &mut State) {
                     .collect();
             }
         } else if name == "TaskCreate" {
+            // TaskCreate's input has no taskId / status — those are assigned by
+            // the runtime and surfaced in the tool_result (e.g. "Task #3
+            // created successfully: ..."). Insert under the tool_use id as a
+            // placeholder; `parse_tool_results` re-keys it to the numeric id
+            // once the result lands. TaskUpdate then keys by that numeric id.
             let status = input
                 .and_then(|i| i.get("status"))
                 .and_then(|v| v.as_str())
@@ -223,6 +228,45 @@ fn parse_tool_results(entry: &Value, state: &mut State) {
         if let Some(agent) = state.agents.get_mut(tool_use_id) {
             agent.completed = true;
         }
+
+        // Re-key TaskCreate entries from the tool_use id to the numeric id that
+        // TaskUpdate will reference. The numeric id is embedded in the result
+        // text: "Task #N created successfully: ...". Without this, every
+        // TaskUpdate misses the HashMap and the completion never registers.
+        if state.tasks.contains_key(tool_use_id) {
+            let result_text = tool_result_text(block);
+            if let Some(numeric_id) = parse_task_create_id(&result_text) {
+                if let Some(task) = state.tasks.remove(tool_use_id) {
+                    state.tasks.insert(numeric_id, task);
+                }
+            }
+        }
+    }
+}
+
+/// Best-effort extraction of the result body as a string. Tool results can be
+/// either a bare string or an array of `{type, text}` content blocks.
+fn tool_result_text(block: &Value) -> String {
+    match block.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// Parse the numeric task id out of "Task #N created successfully: ...".
+/// Returns the digits as a `String` (matches what TaskUpdate's `taskId` looks like).
+fn parse_task_create_id(content: &str) -> Option<String> {
+    let after_hash = content.split_once("Task #")?.1;
+    let id: String = after_hash.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
     }
 }
 
@@ -280,6 +324,10 @@ mod tests {
     }
 
     fn make_tool_result(tool_use_id: &str, is_error: bool) -> String {
+        make_tool_result_with_content(tool_use_id, is_error, "ok")
+    }
+
+    fn make_tool_result_with_content(tool_use_id: &str, is_error: bool, content: &str) -> String {
         serde_json::to_string(&serde_json::json!({
             "type": "user",
             "timestamp": "2026-03-22T10:00:01.000Z",
@@ -289,7 +337,7 @@ mod tests {
                     "type": "tool_result",
                     "tool_use_id": tool_use_id,
                     "is_error": is_error,
-                    "content": "ok"
+                    "content": content
                 }]
             }
         }))
@@ -599,6 +647,46 @@ mod tests {
         let data = parse_transcript(Some(&path), &mut state);
 
         assert_eq!(data.tasks["tc1"].status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn task_create_rekeyed_from_tool_result() {
+        // Real production shape: TaskCreate input has no taskId, but the
+        // tool_result text contains "Task #N". TaskUpdate then references that
+        // numeric N. Without re-keying, every update misses the HashMap.
+        let dir = tempfile::tempdir().unwrap();
+        let lines = vec![
+            make_tool_use(
+                "toolu_abc",
+                "TaskCreate",
+                serde_json::json!({"subject": "do thing", "activeForm": "doing"}),
+            ),
+            make_tool_result_with_content(
+                "toolu_abc",
+                false,
+                "Task #1 created successfully: do thing",
+            ),
+            make_tool_use(
+                "toolu_def",
+                "TaskUpdate",
+                serde_json::json!({"taskId": "1", "status": "completed"}),
+            ),
+        ];
+        let path = write_transcript(&dir, &lines);
+
+        let mut state = State::default();
+        let data = parse_transcript(Some(&path), &mut state);
+
+        assert!(!data.tasks.contains_key("toolu_abc"), "should be re-keyed");
+        assert_eq!(data.tasks["1"].status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn parse_task_create_id_examples() {
+        assert_eq!(parse_task_create_id("Task #1 created successfully: foo"), Some("1".into()));
+        assert_eq!(parse_task_create_id("Task #42 created successfully: bar"), Some("42".into()));
+        assert_eq!(parse_task_create_id("nothing matches here"), None);
+        assert_eq!(parse_task_create_id("Task # missing number"), None);
     }
 
     #[test]

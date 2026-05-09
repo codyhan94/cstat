@@ -44,7 +44,7 @@ mod tests {
     #[test]
     fn missing_file_returns_defaults() {
         let cfg = load_config_from_path(Some(PathBuf::from("/nonexistent/config.toml")));
-        assert_eq!(cfg.separator(), "  ");
+        assert_eq!(cfg.separator(), " │ ");
         assert!(cfg.colors());
         assert_eq!(cfg.path_levels(), 1);
     }
@@ -77,7 +77,7 @@ context_critical = 80
     fn partial_config() {
         let cfg = load_from_str("colors = false\n");
         assert!(!cfg.colors());
-        assert_eq!(cfg.separator(), "  ");
+        assert_eq!(cfg.separator(), " │ ");
         assert_eq!(cfg.path_levels(), 1);
         assert_eq!(cfg.context_warning, None);
     }
@@ -86,14 +86,14 @@ context_critical = 80
     fn malformed_toml_returns_defaults() {
         let cfg = load_from_str("this is not valid toml {{{}}}");
         assert!(cfg.colors());
-        assert_eq!(cfg.separator(), "  ");
+        assert_eq!(cfg.separator(), " │ ");
     }
 
     #[test]
     fn empty_file_returns_defaults() {
         let cfg = load_from_str("");
         assert!(cfg.colors());
-        assert_eq!(cfg.separator(), "  ");
+        assert_eq!(cfg.separator(), " │ ");
     }
 
     #[test]

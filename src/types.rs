@@ -6,6 +6,7 @@ pub struct StdinData {
     pub model: Option<Model>,
     pub context_window: Option<ContextWindow>,
     pub transcript_path: Option<String>,
+    pub session_id: Option<String>,
     pub cwd: Option<String>,
     pub rate_limits: Option<RateLimits>,
 }
@@ -24,8 +25,12 @@ pub struct RateWindow {
 
 pub struct UsageInfo {
     pub usage_5h: Option<f64>,
+    /// Currently unused — weekly is dropped from the rendered line. Still populated
+    /// from rate_limits + state cache so we don't have to plumb a new struct in later.
+    #[allow(dead_code)]
     pub usage_7d: Option<f64>,
     pub reset_5h: Option<i64>,
+    #[allow(dead_code)]
     pub reset_7d: Option<i64>,
 }
 
@@ -42,9 +47,23 @@ pub struct Model {
     pub display_name: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct ContextWindow {
     pub used_percentage: Option<u8>,
+    pub total_input_tokens: Option<u64>,
+    pub current_usage: Option<CurrentUsage>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct CurrentUsage {
+    pub cache_creation_input_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CacheStatus {
+    pub last_cache_hit: Option<i64>,
+    pub last_cache_miss: Option<i64>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -58,7 +77,7 @@ pub struct Config {
 
 impl Config {
     pub fn separator(&self) -> &str {
-        self.separator.as_deref().unwrap_or("  ")
+        self.separator.as_deref().unwrap_or(" │ ")
     }
 
     pub fn colors(&self) -> bool {
@@ -84,6 +103,12 @@ pub struct State {
     pub cached_rate_limits: Option<CachedRateLimits>,
     #[serde(default)]
     pub next_seq: u64,
+    #[serde(default)]
+    pub last_total_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub last_cache_hit: Option<i64>,
+    #[serde(default)]
+    pub last_cache_miss: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
