@@ -7,8 +7,15 @@ pub struct StdinData {
     pub context_window: Option<ContextWindow>,
     pub transcript_path: Option<String>,
     pub session_id: Option<String>,
+    pub session_name: Option<String>,
     pub cwd: Option<String>,
     pub rate_limits: Option<RateLimits>,
+    pub cost: Option<Cost>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct Cost {
+    pub total_cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +116,12 @@ pub struct State {
     pub last_cache_hit: Option<i64>,
     #[serde(default)]
     pub last_cache_miss: Option<i64>,
+    #[serde(default)]
+    pub last_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub last_poll_time: Option<i64>,
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

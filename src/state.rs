@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::types::{CachedRateLimits, State};
 
-const STATE_VERSION: u32 = 3;
+const STATE_VERSION: u32 = 5;
 const RAMDISK: &str = "/Volumes/ramdisk";
 const FALLBACK: &str = "/tmp";
 

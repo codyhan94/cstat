@@ -56,6 +56,16 @@ pub fn parse_transcript(path: Option<&str>, state: &mut State) -> TranscriptData
 
         let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
+        if state.parent_session_id.is_none() {
+            if let Some(sid) = entry
+                .get("forkedFrom")
+                .and_then(|f| f.get("sessionId"))
+                .and_then(|v| v.as_str())
+            {
+                state.parent_session_id = Some(sid.to_string());
+            }
+        }
+
         match entry_type {
             "assistant" => {
                 parse_assistant_message(&entry, state);

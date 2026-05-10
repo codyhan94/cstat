@@ -55,11 +55,50 @@ fn usage_from_cache(cached: &CachedRateLimits) -> Option<UsageInfo> {
 ///
 /// On a warm hit, the cold-miss flag is cleared if older than 30s — this keeps the 💸
 /// visible through a burst of tool-call warm hits within the same response.
-fn update_cache_state(st: &mut State, ctx: &ContextWindow, now: i64) {
+///
+/// Cost delta is checked independently up front: `/recap` and other "invisible" turns
+/// produce a cumulative cost increase but no change to `total_input_tokens` or
+/// `current_usage`, which would otherwise short-circuit below. Any cost increase is
+/// evidence of a recent API call that extended the cache TTL server-side, so we stamp
+/// `last_cache_hit`. We use `cost_stamp_time` (the previous poll's timestamp) rather
+/// than `now` to avoid overestimating TTL when cstat was suspended (e.g. during /btw):
+/// the API call happened before cstat resumed, so stamping `now` would make the cache
+/// appear fresher than it is. Using the prior poll time gives a slight underestimate
+/// (bounded by one poll interval + API latency) instead of a potentially large overestimate.
+fn update_cache_state(st: &mut State, ctx: &ContextWindow, cost_usd: Option<f64>, now: i64, cost_stamp_time: i64) {
+    if let Some(curr_cost) = cost_usd {
+        if let Some(prev_cost) = st.last_cost_usd {
+            if curr_cost > prev_cost {
+                st.last_cache_hit = Some(cost_stamp_time);
+            }
+        }
+        st.last_cost_usd = Some(curr_cost);
+    }
+
     let Some(curr_tokens) = ctx.total_input_tokens else {
         return;
     };
-    let prev_tokens = st.last_total_input_tokens.unwrap_or(0);
+
+    // No prior baseline — fresh state or after a version discard. Cache fields in
+    // stdin may be stale from a long-ago API call. Initialize the count and return
+    // without stamping; the next real turn will produce a meaningful delta.
+    let Some(prev_tokens) = st.last_total_input_tokens else {
+        st.last_total_input_tokens = Some(curr_tokens);
+        return;
+    };
+
+    // Token count dropped from a known baseline — context was rebuilt (e.g. /compact).
+    // Clear all cache stamps: the old prefix is gone and whatever the cost-delta path
+    // may have just stamped is wrong. Also clear last_cost_usd so the first real turn
+    // after compact doesn't get a false warm stamp from the cost-delta path.
+    if curr_tokens < prev_tokens {
+        st.last_cache_hit = None;
+        st.last_cache_miss = None;
+        st.last_cost_usd = None;
+        st.last_total_input_tokens = Some(curr_tokens);
+        return;
+    }
+
     if curr_tokens == prev_tokens {
         return;
     }
@@ -94,8 +133,35 @@ fn main() {
     if let Some((_, mtime)) = &git {
         st.git_index_mtime = Some(*mtime);
     }
+    // For branched sessions: inherit parent's cache timestamps before update_cache_state
+    // runs, so the countdown continues from the parent's remaining TTL rather than
+    // resetting to full TTL. Inheriting last_total_input_tokens causes the equal-tokens
+    // short-circuit to fire on the first tick (which re-emits the parent's context_window
+    // verbatim), preventing a spurious last_cache_hit = Some(now) stamp.
+    if st.last_cache_hit.is_none() {
+        if let Some(pid) = st.parent_session_id.as_deref() {
+            let parent = state::load_state(Some(pid));
+            if let Some(t) = parent.last_cache_hit {
+                st.last_cache_hit = Some(t);
+                st.last_total_input_tokens = parent.last_total_input_tokens;
+            }
+        }
+    }
+    {
+        let cost_usd = data.cost.as_ref().and_then(|c| c.total_cost_usd);
+        let tokens = data.context_window.as_ref().and_then(|c| c.total_input_tokens);
+        let cost_changed = cost_usd.map_or(false, |c| st.last_cost_usd.map_or(true, |p| c > p));
+        let tokens_changed = tokens.map_or(false, |t| st.last_total_input_tokens.map_or(true, |p| t != p));
+        if cost_changed || tokens_changed {
+            stdin::debug_log(&data);
+        }
+    }
     if let Some(ctx) = data.context_window.as_ref() {
-        update_cache_state(&mut st, ctx, chrono::Utc::now().timestamp());
+        let cost_usd = data.cost.as_ref().and_then(|c| c.total_cost_usd);
+        let now = chrono::Utc::now().timestamp();
+        let cost_stamp_time = st.last_poll_time.unwrap_or(now);
+        st.last_poll_time = Some(now);
+        update_cache_state(&mut st, ctx, cost_usd, now, cost_stamp_time);
     }
     let usage = match usage_from_stdin(&data) {
         Some((info, cache)) => {
@@ -141,7 +207,8 @@ mod tests {
     #[test]
     fn first_warm_hit_sets_stamp() {
         let mut st = State::default();
-        update_cache_state(&mut st, &ctx(1000, 500, 200), 1_000_000);
+        st.last_total_input_tokens = Some(500);
+        update_cache_state(&mut st, &ctx(1000, 500, 200), None, 1_000_000, 1_000_000);
         assert_eq!(st.last_total_input_tokens, Some(1000));
         assert_eq!(st.last_cache_hit, Some(1_000_000));
         assert_eq!(st.last_cache_miss, None);
@@ -150,7 +217,8 @@ mod tests {
     #[test]
     fn cold_miss_sets_both_stamps() {
         let mut st = State::default();
-        update_cache_state(&mut st, &ctx(1000, 0, 500), 1_000_000);
+        st.last_total_input_tokens = Some(500);
+        update_cache_state(&mut st, &ctx(1000, 0, 500), None, 1_000_000, 1_000_000);
         assert_eq!(st.last_cache_hit, Some(1_000_000));
         assert_eq!(st.last_cache_miss, Some(1_000_000));
     }
@@ -160,7 +228,7 @@ mod tests {
         let mut st = State::default();
         st.last_cache_hit = Some(999);
         st.last_cache_miss = Some(888);
-        update_cache_state(&mut st, &ctx(1000, 0, 0), 1_000_000);
+        update_cache_state(&mut st, &ctx(1000, 0, 0), None, 1_000_000, 1_000_000);
         // Tokens still update (round-trip happened) but stamps don't.
         assert_eq!(st.last_total_input_tokens, Some(1000));
         assert_eq!(st.last_cache_hit, Some(999));
@@ -172,7 +240,7 @@ mod tests {
         let mut st = State::default();
         st.last_total_input_tokens = Some(1000);
         st.last_cache_hit = Some(500);
-        update_cache_state(&mut st, &ctx(1000, 999, 0), 9_999_999);
+        update_cache_state(&mut st, &ctx(1000, 999, 0), None, 9_999_999, 9_999_999);
         // No update because total_input_tokens didn't change.
         assert_eq!(st.last_cache_hit, Some(500));
     }
@@ -183,7 +251,7 @@ mod tests {
         st.last_total_input_tokens = Some(900);
         st.last_cache_miss = Some(1_000_000);
         // 31s later, a warm hit
-        update_cache_state(&mut st, &ctx(1100, 500, 0), 1_000_031);
+        update_cache_state(&mut st, &ctx(1100, 500, 0), None, 1_000_031, 1_000_031);
         assert_eq!(st.last_cache_miss, None);
         assert_eq!(st.last_cache_hit, Some(1_000_031));
     }
@@ -194,7 +262,7 @@ mod tests {
         st.last_total_input_tokens = Some(900);
         st.last_cache_miss = Some(1_000_000);
         // 20s later, a warm hit (within the 30s window)
-        update_cache_state(&mut st, &ctx(1100, 500, 0), 1_000_020);
+        update_cache_state(&mut st, &ctx(1100, 500, 0), None, 1_000_020, 1_000_020);
         assert_eq!(st.last_cache_miss, Some(1_000_000));
         assert_eq!(st.last_cache_hit, Some(1_000_020));
     }
@@ -204,7 +272,7 @@ mod tests {
         let mut st = State::default();
         st.last_total_input_tokens = Some(900);
         st.last_cache_miss = Some(1_000_000);
-        update_cache_state(&mut st, &ctx(1100, 0, 500), 1_000_500);
+        update_cache_state(&mut st, &ctx(1100, 0, 500), None, 1_000_500, 1_000_500);
         assert_eq!(st.last_cache_miss, Some(1_000_500));
     }
 
@@ -216,8 +284,110 @@ mod tests {
             total_input_tokens: None,
             current_usage: None,
         };
-        update_cache_state(&mut st, &ctx, 1_000_000);
+        update_cache_state(&mut st, &ctx, None, 1_000_000, 1_000_000);
         assert_eq!(st.last_total_input_tokens, None);
         assert_eq!(st.last_cache_hit, None);
+    }
+
+    #[test]
+    fn cost_delta_with_unchanged_tokens_stamps_hit() {
+        // Simulates /recap: tokens and current_usage frozen from the prior real
+        // turn, but cumulative cost increased. We should treat that as a cache hit,
+        // stamped at cost_stamp_time (the prior poll), not at now.
+        let mut st = State::default();
+        st.last_total_input_tokens = Some(1000);
+        st.last_cost_usd = Some(3.05);
+        st.last_cache_hit = Some(500);
+        // cost_stamp_time (999_990) < now (1_000_000): simulates prior-poll timestamp
+        update_cache_state(&mut st, &ctx(1000, 999, 0), Some(3.10), 1_000_000, 999_990);
+        assert_eq!(st.last_cache_hit, Some(999_990));
+        assert_eq!(st.last_cost_usd, Some(3.10));
+    }
+
+    #[test]
+    fn first_poll_initializes_cost_without_stamping() {
+        // First time we see cost, we have no baseline — don't stamp from cost path.
+        // (Token path may still stamp; isolate it by passing 0/0 cache fields.)
+        let mut st = State::default();
+        update_cache_state(&mut st, &ctx(1000, 0, 0), Some(3.05), 1_000_000, 1_000_000);
+        assert_eq!(st.last_cost_usd, Some(3.05));
+        assert_eq!(st.last_cache_hit, None);
+    }
+
+    #[test]
+    fn no_baseline_skips_cache_stamp() {
+        // Stale cache_read in stdin on fresh state must not produce a warm stamp.
+        let mut st = State::default();
+        update_cache_state(&mut st, &ctx(1000, 500, 0), None, 1_000_000, 1_000_000);
+        assert_eq!(st.last_total_input_tokens, Some(1000));
+        assert_eq!(st.last_cache_hit, None);
+    }
+
+    #[test]
+    fn unchanged_cost_does_not_stamp() {
+        let mut st = State::default();
+        st.last_total_input_tokens = Some(1000);
+        st.last_cost_usd = Some(3.05);
+        st.last_cache_hit = Some(500);
+        update_cache_state(&mut st, &ctx(1000, 999, 0), Some(3.05), 1_000_000, 1_000_000);
+        assert_eq!(st.last_cache_hit, Some(500));
+    }
+
+    #[test]
+    fn token_drop_clears_cache_stamps() {
+        // Simulates /compact: cost bumps (compact API call), then tokens drop
+        // because the new context is just the compact summary. Any warm stamp
+        // from the cost-delta path should be cleared.
+        let mut st = State::default();
+        st.last_total_input_tokens = Some(100_000);
+        st.last_cost_usd = Some(5.00);
+        st.last_cache_hit = Some(999);
+        st.last_cache_miss = Some(888);
+        // Cost increased (compact API call) AND tokens dropped to compact summary size.
+        update_cache_state(&mut st, &ctx(12_000, 0, 0), Some(5.80), 1_000_000, 1_000_000);
+        assert_eq!(st.last_cache_hit, None);
+        assert_eq!(st.last_cache_miss, None);
+        assert_eq!(st.last_cost_usd, None);
+        assert_eq!(st.last_total_input_tokens, Some(12_000));
+    }
+
+    #[test]
+    fn token_drop_without_prior_tokens_does_not_clear() {
+        // No saved token baseline → can't tell if this is a drop, and can't trust
+        // cache fields in stdin (they may be stale). Initialize the count and bail.
+        let mut st = State::default();
+        st.last_cache_hit = Some(999);
+        update_cache_state(&mut st, &ctx(12_000, 500, 0), None, 1_000_000, 1_000_000);
+        assert_eq!(st.last_total_input_tokens, Some(12_000));
+        assert_eq!(st.last_cache_hit, Some(999)); // unchanged — no stamping without a baseline
+    }
+
+    #[test]
+    fn branch_inherited_tokens_prevent_spurious_restamp() {
+        // Simulates a branched session's first cstat tick: last_cache_hit and
+        // last_total_input_tokens were inherited from the parent (same token count
+        // as what Claude Code re-emits on the first branch invocation). The
+        // equal-tokens short-circuit should fire, leaving last_cache_hit untouched.
+        let mut st = State::default();
+        st.last_cache_hit = Some(1_000_000); // inherited from parent
+        st.last_total_input_tokens = Some(38383); // inherited from parent
+        // First branch tick: same tokens as parent (verbatim re-emit), warm cache
+        update_cache_state(&mut st, &ctx(38383, 27483, 10893), None, 9_999_999, 9_999_999);
+        // Must NOT restamp to 9_999_999 — short-circuit should have fired
+        assert_eq!(st.last_cache_hit, Some(1_000_000));
+        assert_eq!(st.last_total_input_tokens, Some(38383));
+    }
+
+    #[test]
+    fn branch_first_real_api_call_stamps_normally() {
+        // After the branch's first real API call, tokens differ from inherited baseline.
+        // Normal warm-hit stamping should resume.
+        let mut st = State::default();
+        st.last_cache_hit = Some(1_000_000); // inherited from parent
+        st.last_total_input_tokens = Some(38383); // inherited from parent
+        // First real branch API call: new tokens
+        update_cache_state(&mut st, &ctx(39000, 38376, 615), None, 2_000_000, 2_000_000);
+        assert_eq!(st.last_cache_hit, Some(2_000_000));
+        assert_eq!(st.last_total_input_tokens, Some(39000));
     }
 }

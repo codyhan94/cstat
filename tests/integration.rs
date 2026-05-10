@@ -132,7 +132,14 @@ fn cold_cache_label_present() {
 #[test]
 fn cache_warm_after_warm_hit() {
     // Warm hit (cache_read > 0): hourglass glyph, no cost indicator.
+    // Needs a priming invocation first: fresh state has no token baseline,
+    // so cache fields in stdin are ignored (they may be stale from a prior
+    // session). The second invocation with different tokens triggers a real stamp.
     let sid = unique_sid("warm");
+    let prime = format!(
+        r#"{{"model":{{"display_name":"Opus"}},"cwd":"/tmp/proj","session_id":"{sid}","context_window":{{"total_input_tokens":5000}}}}"#
+    );
+    let _ = run_with_stdin(&prime);
     let input = format!(
         r#"{{"model":{{"display_name":"Opus"}},"cwd":"/tmp/proj","session_id":"{sid}","context_window":{{"total_input_tokens":10000,"current_usage":{{"cache_read_input_tokens":5000,"cache_creation_input_tokens":1000}}}}}}"#
     );
@@ -148,7 +155,12 @@ fn cache_warm_after_warm_hit() {
 #[test]
 fn cache_cold_miss_swaps_glyph() {
     // Cold miss within the last 30s → hourglass swaps to $ (same width, no shift).
+    // Needs a priming invocation first to establish a token baseline.
     let sid = unique_sid("miss");
+    let prime = format!(
+        r#"{{"model":{{"display_name":"Opus"}},"cwd":"/tmp/proj","session_id":"{sid}","context_window":{{"total_input_tokens":5000}}}}"#
+    );
+    let _ = run_with_stdin(&prime);
     let input = format!(
         r#"{{"model":{{"display_name":"Opus"}},"cwd":"/tmp/proj","session_id":"{sid}","context_window":{{"total_input_tokens":10000,"current_usage":{{"cache_read_input_tokens":0,"cache_creation_input_tokens":5000}}}}}}"#
     );
@@ -163,18 +175,28 @@ fn cache_cold_miss_swaps_glyph() {
 fn cache_stamp_persists_across_invocations() {
     // First call: warm hit, stamp written. Second call: same total_input_tokens (no new turn),
     // current_usage is empty → state machine short-circuits, but stamp survives → still ⧖.
+    // Needs a priming invocation first to establish a token baseline.
     let sid = unique_sid("persist");
+    let prime = format!(
+        r#"{{"model":{{"display_name":"Opus"}},"cwd":"/tmp/proj","session_id":"{sid}","context_window":{{"total_input_tokens":5000}}}}"#
+    );
+    let _ = run_with_stdin(&prime);
+
     let input1 = format!(
         r#"{{"model":{{"display_name":"Opus"}},"cwd":"/tmp/proj","session_id":"{sid}","context_window":{{"total_input_tokens":10000,"current_usage":{{"cache_read_input_tokens":5000,"cache_creation_input_tokens":0}}}}}}"#
     );
     let out1 = run_with_stdin(&input1);
-    assert!(String::from_utf8_lossy(&out1.stdout).contains("⧖"));
+    let stdout1 = String::from_utf8_lossy(&out1.stdout);
+    assert!(stdout1.contains("⧖"), "expected warm cache timer after warm hit, got: {stdout1}");
+    assert!(!stdout1.contains("cold"), "expected warm, not cold, got: {stdout1}");
 
     // Second call: same tokens, no current_usage → short-circuits, but stamp persists.
     let input2 = format!(
         r#"{{"model":{{"display_name":"Opus"}},"cwd":"/tmp/proj","session_id":"{sid}","context_window":{{"total_input_tokens":10000}}}}"#
     );
     let out2 = run_with_stdin(&input2);
-    assert!(String::from_utf8_lossy(&out2.stdout).contains("⧖"));
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    assert!(stdout2.contains("⧖"), "warm stamp should persist, got: {stdout2}");
+    assert!(!stdout2.contains("cold"), "warm stamp should persist, got: {stdout2}");
     cleanup_state(&sid);
 }
