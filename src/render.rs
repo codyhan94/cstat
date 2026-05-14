@@ -4,10 +4,10 @@ use crate::git::GitInfo;
 use crate::types::{AgentEntry, CacheStatus, Config, StdinData, TaskItem, TaskStatus, TodoItem, ToolEntry, TranscriptData};
 use crate::types::UsageInfo;
 
-/// Cache TTL in seconds. Set to 280 (not 300) because we stamp on statusline fire,
-/// which lags the API request timestamp by ~20s; using 300 would briefly show "warm"
+/// Cache TTL in seconds. Set to 3580 (not 3600) because we stamp on statusline fire,
+/// which lags the API request timestamp by ~20s; using 3600 would briefly show "warm"
 /// after Anthropic's cache had already expired.
-const CACHE_TTL_SECS: i64 = 280;
+const CACHE_TTL_SECS: i64 = 3580;
 
 fn context_percentage(data: &StdinData) -> Option<u8> {
     data.context_window.as_ref()?.used_percentage

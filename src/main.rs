@@ -124,6 +124,7 @@ fn update_cache_state(st: &mut State, ctx: &ContextWindow, cost_usd: Option<f64>
 }
 
 fn main() {
+    state::prune_stale_state_files();
     let data = stdin::read_stdin();
     let config = config::load_config();
     let mut st = state::load_state(data.session_id.as_deref());

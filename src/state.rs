@@ -70,6 +70,25 @@ pub fn save_state(state: &mut State, session_id: Option<&str>) {
     }
 }
 
+pub fn prune_stale_state_files() {
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(3 * 24 * 3600))
+        .unwrap_or(std::time::UNIX_EPOCH);
+    let Ok(entries) = fs::read_dir(state_dir()) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        if !name.starts_with("cstat-") || !name.ends_with(".bin") || name == "cstat-rate-limits.bin" {
+            continue;
+        }
+        if let Ok(meta) = fs::metadata(&path) {
+            if meta.modified().map_or(false, |m| m < cutoff) {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+}
+
 pub fn load_global_rate_limits() -> Option<CachedRateLimits> {
     let data = fs::read(global_rate_limits_path()).ok()?;
     bincode::deserialize(&data).ok()
